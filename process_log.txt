@@ -1,0 +1,358 @@
+Natural-Language Deadline Organizer - Process Log
+
+
+Part 1: Connect Python to Ollama (llm_client.py)
+
+Attempt 1: No output
+I ran "python3 llm_client.py" and nothing was printed.
+Cause: the file had not been saved yet, so it was empty.
+Fix: saved the file with Command + S.
+
+Attempt 2: Failed with 404
+Error: 404 Client Error: Not Found for url: http://localhost:11434/api/chat
+Cause: Ollama was running, but the qwen3:8b model was not downloaded yet.
+Fix: ran "ollama pull qwen3:8b" and waited for "success".
+
+Improvement: my first error message said "Could not reach Ollama" even for
+the 404 case, which was misleading because Ollama was reached. I changed the
+code to report two different problems:
+  - Ollama not running -> "Could not reach Ollama. Is the app open?"
+  - Ollama answered with an error -> "Ollama returned an error: ..." plus
+    Ollama's own explanation (for example, model not found)
+
+Attempt 3: Succeeded
+The model replied: "Hello!"
+
+Problem case: Ollama closed (tool failure)
+I quit Ollama and ran the program again.
+Result: [Errno 61] Connection refused, and the program reported
+"Could not reach Ollama" instead of crashing without explanation.
+
+Part 2: Save tasks in JSON (storage.py)
+
+Test 1: Save a task - Succeeded
+Running "python3 storage.py" created tasks.json with one task (id 1).
+
+Test 2: Run again - Succeeded
+The new task got id 2, and the list showed both tasks. Task 1 still had its
+original creation time (09:32:05), which proves the file kept the first task
+after the program closed.
+
+Test 3: Damaged file (problem case)
+
+Attempt 1: The test did not trigger
+I deleted the last "]" in tasks.json but did not save the edit. The program
+read the file on disk, which was still valid, so it saved task 3 normally.
+When I then tried to save my edit, VS Code warned: "The content of the file
+is newer." The program had rewritten the file while my edit was unsaved.
+Fix: closed the tab without saving, reopened tasks.json, deleted the "]",
+and saved before running the program.
+
+Attempt 2: Succeeded
+Python failed to read the file:
+  json.decoder.JSONDecodeError: Expecting ',' delimiter: line 30 column 1
+My code caught this and reported:
+  RuntimeError: tasks.json is damaged (not valid JSON). It was not changed.
+No "Saved:" line appeared, and tasks.json was unchanged (still missing the
+"]"), so the program refused to overwrite the user's data.
+Fix after the test: added the "]" back.
+
+What I learned: the program reads the file on disk, not what is shown in
+the editor. Saving must happen before running a test.
+
+Part 3: Check dates (dates.py)
+
+Design decision: Python calculates dates, not the model. Language models
+are often wrong at calendar math and may invent a date. The model only picks
+out the date words; Python turns them into a real date or refuses.
+
+parse_date() returns one of four statuses:
+  ok       - one clear date -> the agent may save the task
+  unclear  - vague, contradictory, or two possible dates -> ask the user
+  missing  - no date at all -> ask the user
+  past     - the date has already passed -> tell the user
+
+Test: 11 example phrases with a fixed "now" (Sunday, 22 Nov 2026, 10:00),
+so the results are the same on every run. All 11 matched the expected result.
+
+  Friday afternoon    ok       Friday, 27 Nov 2026, 17:00  'afternoon' was read as 17:00.
+  tomorrow at 3pm     ok       Monday, 23 Nov 2026, 15:00
+  Nov 30 9am          ok       Monday, 30 Nov 2026, 09:00
+  in 3 days           ok       Wednesday, 25 Nov 2026, 23:59  No time was given, so 23:59 (end of day) was used.
+  next Friday         unclear  'next Friday' could mean either date.  Options: 27 Nov / 04 Dec
+  sometime next week  unclear  'sometime' is too vague to pick one date.
+  Submit the report   missing  No date was found.
+  Sunday              unclear  Today is Sunday, so it could mean today or next week.
+  Friday Dec 5        unclear  The phrase says Friday, but 05 Dec is a Saturday.
+  Feb 30              unclear  That calendar date does not exist.
+  today 8am           past     Sunday, 22 Nov 2026, 08:00  This date and time is already in the past.
+
+Why "next Friday" is unclear: English speakers disagree on whether it means
+this coming Friday or Friday of next week, so Python returns both options
+and the agent asks the user to choose.
+
+Part 4: Define the tools (tools.py)
+
+The model gets a menu of three tools and chooses one:
+  add_task(title, date_phrase) - save a task; Python checks the date words
+  list_tasks(limit)            - show upcoming deadlines
+  ask_user(question)           - ask when the date is missing or unclear
+
+The model only proposes a tool. Nothing is saved yet. Python will check and
+run each proposal in Part 5.
+
+Test: four different messages. The model chose three different tools.
+
+  USER: Submit the report Friday afternoon.
+    MODEL CHOSE: add_task {'title': 'Submit the report', 'date_phrase': 'Friday afternoon'}
+  USER: Prepare slides for the group meeting sometime next week.
+    MODEL CHOSE: add_task {'title': 'Prepare slides for the group meeting', 'date_phrase': 'sometime next week'}
+  USER: Remind me to email my professor.
+    MODEL CHOSE: ask_user {'question': 'When is the deadline for emailing your professor?'}
+  USER: What are my next deadlines?
+    MODEL CHOSE: list_tasks {'limit': 5}
+
+The model copied the user's date words ("Friday afternoon") instead of
+calculating a date, as the system prompt asked.
+
+For "sometime next week," the model still chose add_task. This is not
+a problem: Python's parse_date() will return "unclear" in Part 5, and the
+model must then use that result to ask the user.
+
+Problem found: I first named the file tool.py instead of tools.py.
+Fix: renamed it to tools.py so other files can import it.
+
+Part 5: Parser, validator, and executor (tools.py)
+
+The model only proposes a tool call. Python decides whether it is allowed:
+  Parser    (read_tool_call)     - reads the tool name and arguments
+  Validator (validate_tool_call) - checks the rules before anything runs
+  Executor  (run_tool)           - runs the tool, then re-reads tasks.json
+                                   to confirm the task was really saved
+
+Key rule: the validator checks that date_phrase appears in the user's own
+words. "Never invent a date" is not only a prompt hint; Python enforces it.
+
+Test: hand-written proposals (no model), so I can test bad proposals on
+purpose and get the same results every time. All tests passed.
+
+  Test 1: clear date     add_task "Friday afternoon"
+          -> saved: True, verified_on_disk: True, Friday, 27 Nov 2026, 17:00
+  Test 2: vague date     add_task "sometime next week"
+          -> saved: False, date_status: unclear,
+             next_step: Ask the user for a clear date. Do not guess.
+  Test 3: invented date  add_task "Monday" (user never said a date)
+          -> REJECTED: date_phrase 'Monday' is not in the user's words.
+  Test 4: unknown tool   delete_everything
+          -> REJECTED: Unknown tool 'delete_everything'.
+  Test 5: list           list_tasks
+          -> 1 upcoming task: Submit the report, Friday, 27 Nov 2026, 17:00
+
+Test 6: running again (duplicate check) - Succeeded
+  Test 1 now returned: saved: False, "This task is already saved."
+  The existing task kept id 1 and its original creation time (11:32:38),
+  and list_tasks still showed only 1 task. Python prevents duplicates
+  even if the model calls add_task twice.
+
+  Part 6: The agent loop (agent.py)
+
+Loop for each user message:
+  model proposes a tool -> parser -> validator -> executor
+  -> result goes back to the model as an observation -> repeat
+The loop stops when the model replies with text, calls ask_user,
+or reaches MAX_STEPS (6).
+
+The program also has:
+  - state: the messages list (the model remembers the conversation)
+  - trace: every decision, tool call, and result, saved to trace.txt
+  - budget: MAX_STEPS
+  - evidence check: after each message, Python counts the tasks in
+    tasks.json and warns if the model claims a save that did not happen
+  - "file" command: prints tasks.json from disk without the model
+
+Demo run (the professor's required demonstration) - Succeeded
+  1. "Submit the report Friday afternoon."
+     -> add_task "Friday afternoon" -> saved, verified_on_disk: True
+     -> EVIDENCE: 1 task (before: 0). Saved this turn: [1]
+  2. "Prepare slides for the group meeting sometime next week."
+     -> ask_user "When exactly is the group meeting next week?"
+     -> EVIDENCE: 1 task (before: 1). Nothing saved; no date invented.
+  3. "Wednesday at 3pm" (my answer)
+     -> add_task "Wednesday at 3pm", title "Prepare slides for the group
+        meeting" -> saved, Wednesday, 25 Nov 2026, 15:00
+     -> The model remembered the title from the earlier message (state).
+  4. "What are my next deadlines?"
+     -> list_tasks -> 2 tasks, soonest first (Wednesday, then Friday)
+  5. "file" -> tasks.json on disk matched what the agent said.
+
+Observations:
+  - In Part 4, the model chose add_task for "sometime next week"; this
+    time it chose ask_user directly. Both are correct. The model's choice
+    can vary between runs, which is why Python checks every proposal.
+  - I pasted all messages at once, which made the output hard to read.
+    For the demo, I will type one message at a time.
+
+Part 7: Full tests and problem cases
+
+Run A: Clean demo (typed one message at a time) - Succeeded
+  1. "submit the report at friday afternoon"
+     -> add_task "friday afternoon" -> saved, verified_on_disk: True
+     -> Friday, 27 Nov 2026, 17:00. EVIDENCE: 1 task (before: 0)
+  2. "prepare the slides for the group meeting sometime next week"
+     -> step 1: add_task "sometime next week"
+        -> saved: False, unclear, "Ask the user for a clear date."
+     -> step 2: the model read this result and asked me for a specific
+        date instead of saving. EVIDENCE: 1 task (before: 1)
+     This shows the model using a tool result to decide its next step.
+  3. "maybe wednesday at 3pm"
+     -> add_task "wednesday at 3pm" -> saved, Wednesday, 25 Nov 2026, 15:00
+  4. "what are my next deadline"
+     -> list_tasks -> 2 tasks, soonest first
+  5. "file" -> tasks.json on disk matched the agent's answer.
+
+  Observations:
+  - In step 2 of message 2, the model asked in plain text instead of
+    calling ask_user. The loop handled it correctly.
+  - The agent understood informal, lowercase input.
+  - Limitation: "maybe wednesday at 3pm" was saved as a firm deadline.
+    "maybe" is not in the vague-word list. A future improvement would be
+    to treat words like "maybe" or "probably" as unclear and confirm.
+Run B: Observation changes the next decision - Succeeded
+  1. "Finish the lab report next Friday."
+     -> step 1: add_task "next Friday"
+        -> saved: False, unclear, options: Friday 27 Nov / Friday 04 Dec
+     -> step 2: the model read the result and asked: "Could you please
+        specify whether you mean Friday, 27 Nov 2026, or Friday, 04 Dec
+        2026?" The two dates came from Python, not from the model.
+     -> EVIDENCE: 2 tasks (before: 2). Nothing saved.
+  2. "DEC 4" (my answer, in capital letters)
+     -> add_task "DEC 4" -> saved, Friday, 04 Dec 2026, 23:59
+     -> note: "No time was given, so 23:59 (end of day) was used."
+     -> EVIDENCE: 3 tasks (before: 2). Saved this turn: [3]
+
+  Observations:
+  - This is the clearest example of the model using a tool result to
+    decide its next step: it offered exactly the options Python returned.
+  - Capital letters were handled correctly.
+  - Limitation: the agent said "23:59" but did not mention that it was
+    an assumption, even though the tool's note said so. A future fix is
+    a prompt rule: "Mention any note the tool returns."
+
+Run C: Missing date
+
+Attempt 1: PROBLEM FOUND - the model made a false claim
+  (same long session as Runs A and B)
+  "Remind me to email my professor Claster"
+  -> the model called NO tool and replied:
+     "The task 'Email my professor Claster' has been saved with a
+      deadline of Friday, 04 Dec 2026, 23:59."
+  -> This was false. I never gave a date; the model copied the date
+     from the previous task.
+  -> EVIDENCE: 3 tasks (before: 3). Saved this turn: []
+  -> WARNING: the model says a task was saved, but no add_task
+     succeeded this turn.
+  The evidence check caught the false claim. System prompt rule 5 said
+  "Only say a task was saved if add_task returned saved: true," but the
+  model ignored it. A prompt rule is only a hint; the Python check is
+  what caught the problem.
+  Likely cause: the long history contained several replies like "The
+  task ... has been saved with a deadline of ...", and the model copied
+  that pattern.
+
+  Weakness: the warning was printed, but the user still saw the false
+  message.
+  Fix: if the model's reply claims a save and nothing was saved, Python
+  does not show the reply. It records "CHECK FAILED" in the trace and
+  sends "SYSTEM CHECK FAILED: No task was saved..." back to the model,
+  so the model can correct itself. MAX_STEPS still limits retries.
+
+Attempt 2: No change
+  The output was exactly the same, with no "CHECK FAILED" line.
+  Cause: the old session was still running the old code. Python only
+  loads the code when the program starts.
+  Fix: typed quit and started the program again.
+
+Attempt 3: Correct behavior (new session)
+  "remind me to email my professor Claster."
+  -> ask_user "When is the deadline for emailing your professor Claster?"
+  -> EVIDENCE: 3 tasks (before: 3). Nothing saved.
+  In a new session with a short history, the model did not make the
+  false claim, so the new check was not triggered.
+Attempt 4: The fix worked (long session, same as Attempt 1)
+  I repeated Runs A and B in one session to recreate the long history,
+  then typed "Remind me to email my professor Claster".
+  -> step 1: the model again replied without a tool, claiming a save
+     -> CHECK FAILED: the reply claims a save, but nothing was saved.
+        Sent back to the model.
+     The false reply was NOT shown to the user.
+  -> step 2: the model corrected itself and called ask_user:
+     "When is the deadline for emailing your professor Claster?"
+  -> EVIDENCE: 3 tasks (before: 3). Nothing saved.
+  Result: the same false claim happened again, but this time Python
+  blocked it and the model corrected itself. Before the fix, the user
+  saw the false message; after the fix, the user only saw the correct
+  question.
+
+Run D: Date in the past - Succeeded
+  "Pay the library fine yesterday."
+  -> step 1: add_task "yesterday"
+     -> saved: False, date_status: past,
+        "This date and time is already in the past."
+  -> step 2: the model read the result and replied: "The date
+     'yesterday' is in the past. Could you please provide a clear
+     deadline for paying the library fine?"
+  -> EVIDENCE: 3 tasks (before: 3). Nothing saved.
+
+Run E: Tool failure, Ollama closed - Succeeded
+  While the agent was running, I quit Ollama and typed
+  "What are my next deadlines?"
+  -> SYSTEM ERROR: Could not reach Ollama: ... [Errno 61] Connection refused
+  -> The agent did not crash and kept waiting for the next message.
+  I reopened Ollama and typed the same message again.
+  -> list_tasks -> 3 tasks, soonest first
+  -> EVIDENCE: 3 tasks (before: 3)
+  Result: the agent reported the failure clearly and recovered without
+  restarting. No tasks were lost.
+
+  Problem found: the error message did not include "Is the app open?"
+  Cause: llm_client.py still had the old version from Part 1; the
+  improved version had not been saved.
+  Fix: replaced llm_client.py with the improved version and saved it.
+
+Run F: Damaged task file
+
+Attempt 1: PROBLEM FOUND - our own check was wrong (false positive)
+  I deleted the last "]" in tasks.json and asked
+  "What are my next deadlines?"
+  -> list_tasks -> error: "tasks.json is damaged (not valid JSON).
+     It was not changed."  EVIDENCE: -1 (damaged)
+  -> steps 2-6: every reply was rejected:
+     CHECK FAILED: the reply claims a save, but nothing was saved.
+  -> STOPPED: step budget (MAX_STEPS) reached
+  -> AGENT: "Sorry, I stopped after 6 steps without finishing."
+  Cause (likely): claims_saved() only looked for the WORD "saved" or
+  "added". The model probably used "saved" honestly (for example,
+  "your saved tasks file is damaged"), and my check wrongly treated it
+  as a false claim.
+  I could not confirm this, because the trace did not record the text
+  of the rejected replies.
+  Good: MAX_STEPS stopped the loop instead of letting it run forever.
+
+  Fix 1: claims_saved() now looks for PHRASES that claim a save
+         ("has been saved", "was saved", "has been added", ...),
+         not just the word "saved".
+  Fix 2: the trace now records every rejected reply
+         ("REJECTED REPLY: ..."), so each rejection can be checked.
+
+Attempt 2: Succeeded (after the fix)
+  -> list_tasks -> error: tasks.json is damaged
+  -> step 2: "I couldn't retrieve your deadlines because the file is
+     damaged."
+  -> EVIDENCE: -1 (before: -1). No CHECK FAILED.
+  The model reported the problem honestly and did not invent deadlines.
+  The data was not overwritten.
+  After the test, I put the "]" back.
+
+Lesson: a check can also be wrong. Python checks protect against model
+mistakes, but the checks themselves must be tested, and rejected output
+must be recorded so a person can verify each decision.
